@@ -354,6 +354,9 @@ StackType_t * pxPortInitialiseStack( StackType_t * pxTopOfStack,
 
 # 7.4 實現 Ready Task List
 
+Ready task list 紀錄將要執行的所有 task，並且不同的 ready task list 支援不同的優先級。目前**猜測** FreeRTOS 會在某處將 ready task list 裡的 node 拿出來，作為下一個將要執行的 task (注意 linked list 的 node 只是一個掛勾，即 ```TCB.xStateListItem```)。本章節的例子並沒有支援優先級的功能，因此 task 的選用可以藉由單純的 TCB 互相置換來實現，猜測在後續章節中，出現需要考慮優先級的例子時，ready task list 才會真正介紹。
+
+
 ## 7.4.1 定義 Ready Task List
 
 ```c
@@ -364,7 +367,7 @@ List_t pxReadyTasksLists[ configMAX_PRIORITIES ];
 
 任務創建好後，我們需要把任務添加到列表裡面，表示任務已經就緒，OS 隨時可以調度。Ready task list 定義於 ```task.c``` 文件。其中該列表的大小由 ```configMAX_PRIORITIES``` 這個 preprocessor 定義，目前我們默認為 ```5```，代表 ```pxReadyTasksLists``` 支援 5 種優先級，每種優先級都是一個 linked list。
 
-### 7.4.2 初始化 Ready Task List
+## 7.4.2 初始化 Ready Task List
 
 ```c
 static void prvInitialiseTaskLists( void )
@@ -378,7 +381,7 @@ static void prvInitialiseTaskLists( void )
 }
 ```
 
-### 7.4.3 將任務插入 Ready Task List
+## 7.4.3 將任務插入 Ready Task List
 
 ```c
 prvInitialiseTaskLists();
@@ -402,5 +405,167 @@ vListInsertEnd( &(pxReadyTasksLists[2]), &( ((TCB_t *)(&Task2TCB))->xStateListIt
 
 # 7.5 實現 Scheduler
 
+Scheduler 的工作是排程、調動各個 tasks，以此實現任務切換。為了達成 scheduler 的功能我們需要：**全域變數**以及**任務切換函式**。
+
+整體流程如下：
+
+1. 啟動 task scheduler。
+2. 啟動 first task，利用 SVC 中斷，將任務 stack 的參數放入 CPU register。
+3. 利用 PendSV 中斷，進行任務切換，並在 ```SVHandler``` 進行 context switch。
+
+## 7.5.1 啟動 Scheduler
+
+### 1. vTaskStartScheduler
+
+```pxCurrentTCB``` 是一個全域指針，指向目前執行任務的 TCB。```vTaskStartScheduler``` 的工作在於根據優先級，從 pxReadyTasksLists 更新 ```pxCurrentTCB``` 指針，但是目前並沒有深入到優先級的功能，因此 ```vTaskStartScheduler``` 的 function body 將以簡易的版本呈現如下。
+
+```c
+void vTaskStartScheduler ( void )
+{
+    pxCurrentTCB = &Task1TCB;
+
+    if (xPortStartScheduler() != pdFALSE)
+    {
+        // Starting scheduler successfully.
+        // Will never come back
+    }
+}
+```
+
+需要注意的是，當 scheduler 開始作動後，將會持續運作，不會在回到 ```vTaskStartScheduler``` 這支函式。
 
 
+### 2. xPortStartScheduler
+
+**ARM 架構下各個中斷的整理**
+
+Exception Type          | Explanation
+:-----------------------|:-----------------------------------------------------------------------
+Reset                   | 按下 reset 後會從向量表中指定的位址，用 privileged thread mode開始執行
+NMI                     | 簡單說就是除了 reset 外最強的 exception
+Hard Fault              | 做 exception handler 發生不可預期的悲劇時會觸發這個例外
+Memory Management Fault | memory protection 失敗時，這個例外是 MPU 觸發的，用來禁止裝置進入絕對不可進入的記憶體區域
+Bus Fault               | 執行指令或是 data transaction 時發生記憶體相關的錯誤，可能是 bus 的問題
+Usage fault             | 執行未定義的指令、不合法的未對齊存取、指令執行時出現無效的狀態、exception return 時出錯、除以 0 (需要自行設定)
+SVCall                  | SVC instruction 執行的 supervisor call（在OS的環境下）
+PendSV                  | 在 OS 的環境下，通常是用於 context switch
+SysTick                 | 當 timer 倒數到 0 時觸發，也可以用軟體中斷，OS 會把這個 exception 當成 system tick。
+Interrupt(IRQ)          | 週邊裝置觸發的 exception，或是軟體產生的 request
+
+
+
+Exception number | IRQ number  | Exception type  | Priority         | Vector address       | Activation
+:----------------|:------------|:----------------|:-----------------|:---------------------|:----------
+1                | -           | Reset           | -3, the highest  | 0x00000004           | Asynchronous
+2                | -14         | NMI             | -2               | 0x00000008           | Asynchronous
+3                | -13         | HardFault       | -1               | 0x0000000C           | Synchronous
+4-10             | -           | -               | Reserved         | -                    | -
+11               | -5          | SVCall          | Configurable     | 0x0000002C           | Synchronous
+12-13            | -           | Reserved        | -                | -                    | -
+14               | -2          | PendSV          | Configurable     | 0x00000038           | Asynchronous
+15               | -1          | SysTick         | Configurable     | 0x0000003C           | Asynchronous
+15               | -           | Reserved        | -                | -                    | -
+16 and above     | 0 and above | IRQ             | Configurable     | 0x00000040 and above | Asynchronous
+
+
+SysTick 是 ARM 的心臟，間隔每一小段時間會中斷一次，並且更新 timer，試想若我們如果只利用 SysTick 實現任務接換會發生甚麼狀況？假設 SysTick 每隔 1 ms 會中斷一次，而有個 IO 觸發 IRQ 中斷，需要 5 ms 的時間處理。
+
+若我們將 SysTick 調整為最高優先級：
+
+- **time = 1ms:** 處理 IO 的函式執行到一半，SysTick 中斷，並且做任務切換。
+- **time > 1ms:** 中斷返回後，原本處理 IO 的函式被切換，導致無法正確處理 IO。
+
+若我們將 SysTick 調整為最低優先級：
+
+- **time = 0ms:** 收到 IO 中斷，開始處理 IO 的函式。
+- **time = 1ms:** 收到 SysTick 中斷，但是優先級低，無法及時處理 SysTick。
+- **time = 5ms:** 結束 IO 處理，開始處理 SysTick 中斷，並把 timer 調成錯誤的 1 ms (實際為 5 ms)。
+
+從上述兩個例子我們可以發現，無論是 SysTick 怎麼調整優先級一定會發生錯誤，因此我們將任務切換得功能擺到 PendSV 中斷，並且將 SysTick 的優先級設為最高，防止 timer 出錯，PendSV 的優先級調為最低，避免搶佔其他中斷的執行。
+
+- **time = 0ms:** 收到 IO 中斷，開始處理 IO 的函式。
+- **time = 1ms:** 收到 SysTick 中斷，開啟 PendSV 中斷，並更新 timer。
+- **time > 1ms:** 不會被 PendSV 搶佔，而是回到 IO 中斷，繼續處理 IO。
+- **time = 2ms:** 收到 SysTick 中斷，開啟 PendSV 中斷，並更新 timer。
+- **time > 2ms:** 不會被 PendSV 搶佔，而是回到 IO 中斷，繼續處理 IO。
+- **time = 3ms:** 收到 SysTick 中斷，開啟 PendSV 中斷，並更新 timer。
+- **time > 3ms:** 不會被 PendSV 搶佔，而是回到 IO 中斷，繼續處理 IO。
+- **time = 4ms:** 收到 SysTick 中斷，開啟 PendSV 中斷，並更新 timer。
+- **time > 4ms:** 不會被 PendSV 搶佔，而是回到 IO 中斷，繼續處理 IO。
+- **time = 5ms:** 收到 SysTick 中斷，開啟 PendSV 中斷，並更新 timer。
+- **time > 5ms:** 結束 IO 處理，開始處理 PendSV 中斷，任務切換成功。
+
+
+以下是 ```xPortStartScheduler``` 的簡化版，和我們非相關的設定是並沒有呈現。FreeRTOS 將 PendSV 以及 SysTick 調整到最低，並開始我們的第一個任務。將 SysTick 的優先度調整為最低的用意在於，我們可以讓系統達到 real-time 的效能，timer 的計時可能會因此出現錯誤，但是這並不會影響多大。就像人類的心臟一樣，有時候一分鐘跳 70 下、有時候一分鐘跳 90 下，雖然頻率不固定，但是最終都會達到任務切換的目的，以此換取 IO 處理的效能。
+
+```c
+BaseType_t xPortStartScheduler( void )
+{
+    /* Make PendSV and SysTick the lowest priority interrupts. */
+    portNVIC_SHPR3_REG |= portNVIC_PENDSV_PRI;
+    portNVIC_SHPR3_REG |= portNVIC_SYSTICK_PRI;
+
+    vPortStartFirstTask();
+
+    /* Not supposed to run to here. */
+    return 0;
+}
+```
+
+
+
+### 3. prvStartFirstTask
+
+```prvStartFirstTask``` 的工作在於，更新 main stack pointer (MSP)，並且產生 SVC 中斷。首先，```0xE000ED08``` 這個位址儲存了 SCB_VTOR 這個 register 的地址，我們起始階段需要將 MSP 的值更新成 SCB_VTOR。
+
+接著中斷(exception)、異常(Fault)會被全部允許，並且開啟一個 SVC 的中斷服務。
+
+```c
+__asm void prvStartFirstTask( void )
+{
+/* *INDENT-OFF* */
+    PRESERVE8
+
+    /* Use the NVIC offset register to locate the stack. */
+    ldr r0, =0xE000ED08
+    ldr r0, [ r0 ]
+    ldr r0, [ r0 ]
+
+    /* Set the msp back to the start of the stack. */
+    msr msp, r0
+    /* Globally enable interrupts. */
+    cpsie i
+    cpsie f
+    dsb
+    isb
+    /* Call SVC to start the first task. */
+    svc 0
+    nop
+    nop
+/* *INDENT-ON* */
+}
+```
+
+**Note:**
+
+- ```ldr r0, =0xE000ED08```：將 0xE000ED08 加載到 r0。
+- ```ldr r0, [ r0 ]```：將 r0 指向位址的值加載到 r0。
+- ```msr msp r0```：加載特殊功能 register (r0) 的值到 msp。
+- ```svc 0 ```：啟動 SVC 中斷。
+
+**Note:**
+
+CPS command | Mask        | Description
+:-----------|:-----------:|:-----------
+CPSID I     | PRIMASK=1   | 關中斷
+CPSIE I     | PRIMASK=0   | 開中斷
+CPSID F     | FAULTMASK=1 | 關異常
+CPSIE F     | FAULTMASK=0 | 開異常
+
+**Note:**
+
+Cortext-M Core Register Nmae | Description
+:----------------------------|:-------------------------------------------------------------------------------
+PRIMASK                      | 為 1 時所有的中斷無法開啟，只剩下 NMI 和 HardFault 可以響應。 為 0 代表允許所有中斷。
+FAULTMASK                    | 為 1 時只有 NMI 可以響應，所有其他中斷、HardFault 皆無法響應。為 0 代表允許所有中斷。
+BASEPRI                      | 為 0 時代表不關閉任何中斷，為 x 時代表優先級大於等於 x 的中斷將會被忽略。
